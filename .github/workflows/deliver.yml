@@ -1,0 +1,347 @@
+# Liefert das fertige Website-Paket aus IDrive e2 (Bucket smyst-site-releases)
+# per GitHub Pages auf smyst.com aus. Kein Quellcode in diesem Projekt.
+#
+# Auslöser: nur Zeitplan (alle 30 Min) und Handstart. Bewusst KEIN push,
+# pull_request, fork oder issue_comment.
+# Automatisch ausgeliefert wird nur, wenn ein neues Paket vorliegt UND die
+# Repo-Variable SMYST_SITE_AUTO_DEPLOY == 'true' ist. Von Hand: deploy = true.
+# Der Workflow schaltet die Pages-Quelle NIE um. Steht sie nicht auf
+# „GitHub Actions“, wird nichts ausgeliefert (Wartungsseite bleibt live).
+
+name: Auslieferung smyst.com
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Wirklich ausliefern? (aus = nur prüfen)"
+        type: boolean
+        default: false
+      slot:
+        description: "Welches Paket: current = neuester Stand, previous = Rückweg auf den vorherigen Stand"
+        type: choice
+        options:
+          - current
+          - previous
+        default: current
+
+permissions: {}
+
+concurrency:
+  group: smyst-site-deliver
+  cancel-in-progress: false
+
+env:
+  E2_ENDPOINT: https://s3.us-west-2.idrivee2.com
+  E2_REGION: us-west-2
+  E2_BUCKET: smyst-site-releases
+  SITE_URL: https://smyst.com
+  SITE_CNAME: smyst.com
+
+jobs:
+  check:
+    name: Prüfen, ob ein neues Paket vorliegt
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      deploy: ${{ steps.decide.outputs.deploy }}
+      reason: ${{ steps.decide.outputs.reason }}
+      slot: ${{ steps.decide.outputs.slot }}
+      key: ${{ steps.decide.outputs.key }}
+      release: ${{ steps.decide.outputs.release }}
+      sha256: ${{ steps.decide.outputs.sha256 }}
+      bytes: ${{ steps.decide.outputs.bytes }}
+      files: ${{ steps.decide.outputs.files }}
+    steps:
+      - name: Paketstand mit Live-Stand vergleichen
+        id: decide
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.E2_SITE_READ_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.E2_SITE_READ_SECRET_KEY }}
+          AWS_DEFAULT_REGION: us-west-2
+          AWS_EC2_METADATA_DISABLED: "true"
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_DEPLOY: ${{ inputs.deploy }}
+          INPUT_SLOT: ${{ inputs.slot }}
+          AUTO_DEPLOY: ${{ vars.SMYST_SITE_AUTO_DEPLOY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+
+          deploy=false; reason=""; slot=current; key=""
+          release=""; sha256=""; bytes=""; files=""
+          finish() {
+            {
+              echo "deploy=$deploy"; echo "reason=$reason"; echo "slot=$slot"; echo "key=$key"
+              echo "release=$release"; echo "sha256=$sha256"; echo "bytes=$bytes"; echo "files=$files"
+            } >> "$GITHUB_OUTPUT"
+            {
+              echo "### Auslieferung smyst.com"
+              echo "- Ergebnis: **deploy=$deploy**"
+              echo "- Grund: $reason"
+              echo "- Paket: ${key:-–} / Release: ${release:-(aus Paket)}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+          # stop <grund>: im Zeitplan-Lauf nur Hinweis (grün), beim Handstart mit deploy=true Fehler (rot).
+          stop() {
+            deploy=false; reason="$1"
+            if [ "$manual" = true ]; then
+              echo "::error title=Auslieferung gestoppt::$reason"; finish; exit 1
+            fi
+            echo "::notice title=Keine Auslieferung::$reason"; finish; exit 0
+          }
+
+          manual=false
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${INPUT_DEPLOY:-false}" = "true" ]; then manual=true; fi
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then slot="${INPUT_SLOT:-current}"; fi
+          case "$slot" in
+            current|previous) ;;
+            *) slot=current; stop "Unbekannter Slot." ;;
+          esac
+          key="site/$slot.tar.zst"
+
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            stop "Secrets E2_SITE_READ_ACCESS_KEY / E2_SITE_READ_SECRET_KEY fehlen noch – nichts zu tun."
+          fi
+
+          s3get() { aws s3 cp "s3://$E2_BUCKET/$1" "$2" --endpoint-url "$E2_ENDPOINT" --region "$E2_REGION" --only-show-errors; }
+          valid_release() { [[ "$1" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7}$ ]]; }
+          valid_sha() { [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+          valid_int() { [[ "$1" =~ ^[0-9]{1,15}$ ]]; }
+
+          # 1) site/latest.json aus e2 holen und prüfen
+          if ! s3get site/latest.json "$work/latest.json" >/dev/null 2>"$work/err"; then
+            echo "::warning title=e2 nicht erreichbar::site/latest.json konnte nicht gelesen werden."
+            stop "site/latest.json nicht lesbar (e2 oder Schlüssel prüfen)."
+          fi
+          latest_release="$(jq -r '.release // empty' "$work/latest.json" 2>/dev/null || true)"
+          latest_sha="$(jq -r '.sha256 // empty' "$work/latest.json" 2>/dev/null || true)"
+          latest_bytes="$(jq -r '.bytes // empty' "$work/latest.json" 2>/dev/null || true)"
+          latest_files="$(jq -r '.files // empty' "$work/latest.json" 2>/dev/null || true)"
+          if ! valid_release "$latest_release" || ! valid_sha "$latest_sha" || ! valid_int "$latest_bytes" || ! valid_int "$latest_files"; then
+            stop "site/latest.json ist unvollständig oder ungültig."
+          fi
+
+          # 2) Live-Stand https://smyst.com/release.json (darf fehlen, z. B. Wartungsseite)
+          live_release=""
+          if curl -fsSL --max-time 20 "$SITE_URL/release.json?check=$(date +%s)" -o "$work/live.json" 2>/dev/null; then
+            live_release="$(jq -r '.release // empty' "$work/live.json" 2>/dev/null || true)"
+          fi
+          echo "Neuestes Paket: $latest_release"
+          echo "Live auf smyst.com: ${live_release:-(keine release.json)}"
+          new=false
+          [ "$latest_release" != "$live_release" ] && new=true
+
+          # 3) Ziel-Paket festlegen
+          if [ "$slot" = current ]; then
+            release="$latest_release"; sha256="$latest_sha"; bytes="$latest_bytes"; files="$latest_files"
+          else
+            # Rückweg: previous.json ist optional. Fehlt sie, wird die Prüfsumme nicht verglichen,
+            # sondern die Release-ID aus dem Paket selbst gelesen (Prüfung im Deploy-Job).
+            if s3get site/previous.json "$work/prev.json" >/dev/null 2>&1; then
+              p_rel="$(jq -r '.release // empty' "$work/prev.json" 2>/dev/null || true)"
+              p_sha="$(jq -r '.sha256 // empty' "$work/prev.json" 2>/dev/null || true)"
+              p_bytes="$(jq -r '.bytes // empty' "$work/prev.json" 2>/dev/null || true)"
+              p_files="$(jq -r '.files // empty' "$work/prev.json" 2>/dev/null || true)"
+              if valid_release "$p_rel" && valid_sha "$p_sha"; then
+                release="$p_rel"; sha256="$p_sha"
+                valid_int "$p_bytes" && bytes="$p_bytes"
+                valid_int "$p_files" && files="$p_files"
+              fi
+            fi
+          fi
+
+          # 4) Entscheidung
+          if [ "$manual" = true ]; then
+            deploy=true; reason="Handstart mit deploy=true (Slot $slot)."
+          elif [ "$EVENT_NAME" = "schedule" ] && [ "$new" = true ] && [ "${AUTO_DEPLOY:-}" = "true" ]; then
+            deploy=true; reason="Neues Paket $latest_release, automatische Auslieferung ist an."
+          elif [ "$new" = true ]; then
+            deploy=false; reason="Neues Paket $latest_release liegt bereit, automatische Auslieferung ist aus (SMYST_SITE_AUTO_DEPLOY != 'true')."
+          else
+            deploy=false; reason="Paket $latest_release ist bereits live."
+          fi
+
+          # 5) Schutz: Pages-Quelle muss „GitHub Actions“ sein. Wird NIE automatisch umgeschaltet.
+          if [ "$deploy" = true ]; then
+            build_type="$(gh api "repos/$GITHUB_REPOSITORY/pages" --jq '.build_type' 2>/dev/null || echo unbekannt)"
+            if [ "$build_type" != "workflow" ]; then
+              stop "Pages-Quelle ist '$build_type' statt 'GitHub Actions' – Wartungsseite bleibt live. Inhaber muss die Quelle beim Go-Live umstellen."
+            fi
+          fi
+
+          echo "Entscheidung: deploy=$deploy – $reason"
+          finish
+
+  deploy:
+    name: Paket prüfen und ausliefern
+    needs: check
+    if: needs.check.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      PKG_KEY: ${{ needs.check.outputs.key }}
+      EXPECTED_RELEASE: ${{ needs.check.outputs.release }}
+      EXPECTED_SHA256: ${{ needs.check.outputs.sha256 }}
+      EXPECTED_BYTES: ${{ needs.check.outputs.bytes }}
+      EXPECTED_FILES: ${{ needs.check.outputs.files }}
+      MIN_FILES: "1000"
+      MAX_SITE_BYTES: "10000000000"
+    steps:
+      - name: Plattenplatz freimachen
+        shell: bash
+        run: |
+          df -h / || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift /usr/local/julia* || true
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          command -v zstd >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zstd; }
+          df -h / || true
+
+      - name: Paket laden, Prüfsumme prüfen, entpacken
+        id: verify
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.E2_SITE_READ_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.E2_SITE_READ_SECRET_KEY }}
+          AWS_DEFAULT_REGION: us-west-2
+          AWS_EC2_METADATA_DISABLED: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=Paketprüfung::$1"; exit 1; }
+          [[ "$PKG_KEY" =~ ^site/(current|previous)\.tar\.zst$ ]] || fail "Ungültiger Paketschlüssel."
+          [ -z "$EXPECTED_RELEASE" ] || [[ "$EXPECTED_RELEASE" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7}$ ]] || fail "Ungültige Release-ID."
+          [ -z "$EXPECTED_SHA256" ] || [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "Ungültige Prüfsumme."
+
+          pkgdir="${RUNNER_TEMP:?}/smyst-pkg"
+          site="${GITHUB_WORKSPACE:?}/_site"
+          rm -rf "$pkgdir" "$site"; mkdir -p "$pkgdir" "$site"
+          pkg="$pkgdir/site.tar.zst"
+
+          # Genug Platz? Paket + Reserve für entpackte Website und Pages-Artefakt.
+          avail=$(( $(df -Pk "$pkgdir" | awk 'NR==2{print $4}') * 1024 ))
+          need=$(( ${EXPECTED_BYTES:-0} + 12000000000 ))
+          echo "Frei: $avail Bytes, benötigt (geschätzt): $need Bytes"
+          [ "$avail" -ge "$need" ] || fail "Zu wenig Plattenplatz für das Paket."
+
+          aws s3 cp "s3://$E2_BUCKET/$PKG_KEY" "$pkg" --endpoint-url "$E2_ENDPOINT" --region "$E2_REGION" --only-show-errors \
+            || fail "Paket $PKG_KEY konnte nicht geladen werden."
+
+          size=$(wc -c < "$pkg" | tr -d ' ')
+          if [ -n "$EXPECTED_BYTES" ] && [ "$size" != "$EXPECTED_BYTES" ]; then
+            fail "Paketgröße $size passt nicht zu latest.json ($EXPECTED_BYTES)."
+          fi
+          actual_sha="$(sha256sum "$pkg" | awk '{print $1}')"
+          if [ -n "$EXPECTED_SHA256" ]; then
+            [ "$actual_sha" = "$EXPECTED_SHA256" ] || fail "Prüfsumme stimmt nicht (Paket evtl. gerade neu hochgeladen – nächster Lauf versucht es erneut)."
+            echo "Prüfsumme OK."
+          else
+            echo "::warning title=Rückweg::Keine site/previous.json – Prüfsumme nicht vergleichbar, nur Unversehrtheit wird geprüft."
+            zstd -tq "$pkg" || fail "Paket ist beschädigt."
+          fi
+
+          # Nur normale Dateien und Ordner, keine absoluten Pfade und kein '..'
+          zstd -dcq "$pkg" | tar -tvf - > "$pkgdir/list-v.txt" || fail "Paketinhalt nicht lesbar."
+          bad_types=$(cut -c1 "$pkgdir/list-v.txt" | grep -cv '^[-d]$' || true)
+          [ "$bad_types" = "0" ] || fail "Paket enthält $bad_types Links oder Sonderdateien."
+          zstd -dcq "$pkg" | tar -tf - > "$pkgdir/list.txt"
+          if grep -Eq '(^/|(^|/)\.\.(/|$))' "$pkgdir/list.txt"; then fail "Paket enthält unsichere Pfade."; fi
+
+          zstd -dcq "$pkg" | tar -xf - -C "$site" --no-same-owner --no-same-permissions || fail "Entpacken fehlgeschlagen."
+          rm -f "$pkg" "$pkgdir/list-v.txt" "$pkgdir/list.txt"
+          chmod -R u+rwX,go+rX "$site"
+          echo "Paket entpackt, Archiv gelöscht."
+
+      - name: Plausibilität der Website prüfen
+        id: plausible
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=Plausibilität::$1"; exit 1; }
+          site="${GITHUB_WORKSPACE:?}/_site"
+          [ -s "$site/index.html" ] || fail "index.html fehlt."
+          [ -s "$site/404.html" ] || fail "404.html fehlt."
+          [ -f "$site/CNAME" ] || fail "CNAME fehlt."
+          cname="$(tr -d ' \r\n\t' < "$site/CNAME")"
+          [ "$cname" = "$SITE_CNAME" ] || fail "CNAME ist '$cname' statt '$SITE_CNAME'."
+          [ -f "$site/release.json" ] || fail "release.json fehlt."
+          site_release="$(jq -r '.release // empty' "$site/release.json" 2>/dev/null || true)"
+          [[ "$site_release" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7}$ ]] || fail "release.json enthält keine gültige Release-ID."
+          if [ -n "$EXPECTED_RELEASE" ] && [ "$site_release" != "$EXPECTED_RELEASE" ]; then
+            fail "release.json ($site_release) passt nicht zu latest.json ($EXPECTED_RELEASE)."
+          fi
+          read -r count total links < <(python3 - "$site" <<'PY'
+          import os, sys
+          root = sys.argv[1]; n = 0; total = 0; links = 0
+          for d, dirs, fs in os.walk(root):
+              for name in dirs + fs:
+                  if os.path.islink(os.path.join(d, name)):
+                      links += 1
+              for name in fs:
+                  p = os.path.join(d, name)
+                  if not os.path.islink(p):
+                      n += 1; total += os.path.getsize(p)
+          print(n, total, links)
+          PY
+          )
+          echo "Dateien: $count, Größe: $total Bytes, Links: $links"
+          [ "$links" = "0" ] || fail "Website enthält Links."
+          [ "$count" -gt "$MIN_FILES" ] || fail "Nur $count Dateien (Minimum $MIN_FILES)."
+          [ "$total" -lt "$MAX_SITE_BYTES" ] || fail "Website ist $total Bytes groß (Pages-Grenze 10 GB)."
+          if [ -n "$EXPECTED_FILES" ] && [ "$count" != "$EXPECTED_FILES" ]; then
+            echo "::warning title=Dateianzahl::$count Dateien statt $EXPECTED_FILES laut latest.json."
+          fi
+          echo "release=$site_release" >> "$GITHUB_OUTPUT"
+          echo "- Geprüft: $count Dateien, $total Bytes, Release $site_release" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pages-Artefakt hochladen
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: _site
+
+      - name: Auf GitHub Pages ausliefern
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        with:
+          timeout: 1800000
+
+      - name: Smoke-Test der Live-Seite
+        env:
+          RELEASE: ${{ steps.plausible.outputs.release }}
+          SMOKE_TRIES: "20"
+          SMOKE_WAIT: "30"
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{7}$ ]] || { echo "::error::Keine Release-ID für den Test."; exit 1; }
+          status() { curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$1" 2>/dev/null || echo 000; }
+          for i in $(seq 1 "$SMOKE_TRIES"); do
+            t="$(date +%s)-$i"
+            home="$(status "$SITE_URL/?smoke=$t")"
+            live="$(curl -fsSL --max-time 20 "$SITE_URL/release.json?smoke=$t" 2>/dev/null | jq -r '.release // empty' 2>/dev/null || true)"
+            missing="$(status "$SITE_URL/smoke-test-gibt-es-nicht-$t")"
+            echo "Versuch $i: Startseite=$home release=${live:-–} 404-Test=$missing"
+            if [ "$home" = "200" ] && [ "$live" = "$RELEASE" ] && [ "$missing" = "404" ]; then
+              echo "Smoke-Test bestanden: $RELEASE ist live."
+              echo "- Smoke-Test bestanden: $RELEASE live auf $SITE_URL" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            [ "$i" -lt "$SMOKE_TRIES" ] && sleep "$SMOKE_WAIT"
+          done
+          echo "::error title=Smoke-Test::$SITE_URL zeigt nach der Auslieferung nicht Release $RELEASE (oder Status falsch). Bitte prüfen; Rückweg: Handstart mit slot=previous."
+          exit 1
